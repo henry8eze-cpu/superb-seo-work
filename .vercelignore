@@ -1,0 +1,12 @@
+# Never upload local secrets or build output
+.env
+.env.*
+.next
+node_modules
+# Local-only tooling
+.claude
+.agents
+.windsurf
+tests
+vitest.config.mts
+tsconfig.tsbuildinfo

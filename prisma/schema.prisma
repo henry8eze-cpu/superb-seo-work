@@ -1,0 +1,1193 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+//
+// Layout:
+//   1. Accounts & roles
+//   2. School database (research, verification, onboarding)
+//   3. Course inventory: School → Branch → CourseType → Intake → SeatHold / Booking
+//   4. Money: payments, refunds, commission, subscriptions
+//   5. Communication, support, audit, analytics
+//   6. Legacy single-school models (kept until the new equivalents fully replace them)
+//
+// Money is always stored as integer cents plus an ISO currency code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 1. Accounts & roles
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  PLATFORM_ADMIN
+  SCHOOL_USER // access to schools is granted through SchoolMembership
+  STUDENT
+  INSTRUCTOR // legacy
+}
+
+enum MembershipRole {
+  OWNER
+  STAFF
+}
+
+enum MembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String?
+  name      String
+  role      UserRole @default(STUDENT)
+  locale    String   @default("de")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student    Student?
+  instructor Instructor?
+  adminNotes AdminNote[]
+
+  memberships         SchoolMembership[]
+  bookingsCreated     Booking[]           @relation("BookingCreatedBy")
+  bookingsAsStudent   Booking[]           @relation("BookingStudentUser")
+  enquiries           Enquiry[]           @relation("EnquiryUser")
+  enquiriesAnswered   Enquiry[]           @relation("EnquiryRespondedBy")
+  claims              ProfileClaim[]      @relation("ClaimUser")
+  claimsReviewed      ProfileClaim[]      @relation("ClaimReviewer")
+  invitationsSent     SchoolInvitation[]
+  contactAttempts     ContactAttempt[]
+  researchSources     ResearchSource[]
+  importBatches       ImportBatch[]
+  notifications       Notification[]
+  auditEvents         AuditEvent[]
+  supportRequests     SupportRequest[]    @relation("SupportRequester")
+  supportAssigned     SupportRequest[]    @relation("SupportAssignee")
+  paymentsRecorded    Payment[]
+  refundsCreated      Refund[]
+  schoolsVerified     School[]            @relation("SchoolVerifiedBy")
+  courseTypesReviewed CourseType[]        @relation("CourseTypeReviewedBy")
+  intakesConfirmed    Intake[]            @relation("IntakeConfirmedBy")
+  commissionTerms     CommissionTerms[]
+  duplicatesResolved  DuplicateCandidate[]
+
+  @@map("users")
+}
+
+model SchoolMembership {
+  id                String           @id @default(cuid())
+  schoolId          String
+  userId            String
+  role              MembershipRole   @default(STAFF)
+  status            MembershipStatus @default(ACTIVE)
+  // Owners implicitly have every permission; these flags apply to STAFF.
+  canManageCourses  Boolean          @default(false)
+  canManageBookings Boolean          @default(false)
+  canViewFinances   Boolean          @default(false)
+  canManageStaff    Boolean          @default(false)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([schoolId, userId])
+  @@index([userId])
+  @@map("school_memberships")
+}
+
+// ---------------------------------------------------------------------------
+// 2. School database
+// ---------------------------------------------------------------------------
+
+enum SchoolStatus {
+  DISCOVERED // identified, details not yet verified
+  VERIFIED // operating, basic public details confirmed
+  PARTNER // claimed its profile and agreed to participate
+  INACTIVE // closed, merged away, or should no longer be shown
+}
+
+enum OnboardingStage {
+  NOT_CONTACTED
+  CONTACTED
+  INVITED
+  CLAIM_PENDING
+  ONBOARDED
+  DECLINED
+}
+
+enum SchoolType {
+  PRIVATE
+  VHS // Volkshochschule
+  UNIVERSITY
+  NON_PROFIT
+  OTHER
+}
+
+enum CityResearchStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  DONE
+}
+
+enum SourceType {
+  SCHOOL_WEBSITE
+  PUBLIC_REGISTRY
+  VHS_DIRECTORY
+  BAMF_LIST
+  PHONE_CALL
+  EMAIL
+  SCHOOL_PROVIDED
+  IMPORT
+  OTHER
+}
+
+enum ContactChannel {
+  EMAIL
+  PHONE
+  VISIT
+  CONTACT_FORM
+  OTHER
+}
+
+enum ContactOutcome {
+  NO_RESPONSE
+  INTERESTED
+  NOT_INTERESTED
+  CALL_BACK
+  INVITED
+  WRONG_CONTACT
+  OTHER
+}
+
+enum InvitationKind {
+  CLAIM // invite a school representative to claim the profile
+  STAFF // invite a colleague into an existing school workspace
+}
+
+enum ClaimStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum DuplicateStatus {
+  OPEN
+  MERGED
+  DISMISSED
+}
+
+model City {
+  id             String             @id @default(cuid())
+  name           String             @unique
+  slug           String             @unique
+  state          String             @default("NRW")
+  priority       Int                @default(100) // lower = researched first
+  researchStatus CityResearchStatus @default(NOT_STARTED)
+  lat            Float?
+  lng            Float?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  schools       School[]
+  branches      Branch[]
+  importBatches ImportBatch[]
+
+  @@map("cities")
+}
+
+model Language {
+  code      String  @id // ISO 639-1, e.g. "de"
+  nameEn    String
+  nameDe    String
+  active    Boolean @default(true)
+  sortOrder Int     @default(100)
+
+  courseTypes CourseType[]
+
+  @@map("languages")
+}
+
+model School {
+  id              String          @id @default(cuid())
+  slug            String          @unique
+  name            String
+  legalName       String? // only set once verified
+  description     String?         @db.Text
+  website         String?
+  websiteDomain   String? // normalised, for duplicate detection
+  publicEmail     String?
+  phone           String?
+  phoneNormalized String? // digits only with country code, for duplicate detection
+  nameNormalized  String // lower-case, legal suffixes stripped, for duplicate detection
+  schoolType      SchoolType      @default(PRIVATE)
+  languagesOffered   String[]     @default([])
+  courseTypesOffered CourseCategory[] @default([])
+  cityId          String?
+  status          SchoolStatus    @default(DISCOVERED)
+  onboardingStage OnboardingStage @default(NOT_CONTACTED)
+  // Enforced by a CHECK constraint in the migration: only PARTNER schools may enable this.
+  instantBookingEnabled Boolean   @default(false)
+  // Lets students confirm without card payment. Only when the school expressly enables it.
+  allowPayAtSchool      Boolean   @default(false)
+  lastCheckedAt   DateTime?
+  verifiedAt      DateTime?
+  verifiedById    String?
+  partnerSince    DateTime?
+  inactiveReason  String?
+  mergedIntoId    String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  city       City?   @relation(fields: [cityId], references: [id])
+  verifiedBy User?   @relation("SchoolVerifiedBy", fields: [verifiedById], references: [id])
+  mergedInto School? @relation("SchoolMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom School[] @relation("SchoolMerge")
+
+  branches         Branch[]
+  courseTypes      CourseType[]
+  intakes          Intake[]
+  bookings         Booking[]
+  memberships      SchoolMembership[]
+  sources          ResearchSource[]
+  contactAttempts  ContactAttempt[]
+  staffContacts    StaffContact[]
+  invitations      SchoolInvitation[]
+  claims           ProfileClaim[]
+  enquiries        Enquiry[]
+  payments         Payment[]
+  commissionTerms  CommissionTerms[]
+  subscriptions    Subscription[]
+  notifications    Notification[]
+  supportRequests  SupportRequest[]
+  auditEvents      AuditEvent[]
+  duplicateOf      DuplicateCandidate[] @relation("DuplicateSchool")
+  duplicateTargets DuplicateCandidate[] @relation("DuplicateOther")
+
+  @@index([status])
+  @@index([cityId, status])
+  @@index([nameNormalized])
+  @@index([websiteDomain])
+  @@index([phoneNormalized])
+  @@map("schools")
+}
+
+// Where a researched fact came from. `field` is null for a general source about the school.
+model ResearchSource {
+  id          String     @id @default(cuid())
+  schoolId    String
+  field       String?
+  url         String?
+  sourceType  SourceType @default(SCHOOL_WEBSITE)
+  retrievedAt DateTime   @default(now())
+  notes       String?
+  createdById String?
+  createdAt   DateTime   @default(now())
+
+  school    School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  createdBy User?  @relation(fields: [createdById], references: [id])
+
+  @@index([schoolId])
+  @@map("research_sources")
+}
+
+model ImportBatch {
+  id             String   @id @default(cuid())
+  cityId         String?
+  fileName       String?
+  rowCount       Int      @default(0)
+  createdCount   Int      @default(0)
+  duplicateCount Int      @default(0)
+  skippedCount   Int      @default(0)
+  errors         Json?
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  city       City?                @relation(fields: [cityId], references: [id])
+  createdBy  User                 @relation(fields: [createdById], references: [id])
+  duplicates DuplicateCandidate[]
+
+  @@map("import_batches")
+}
+
+// A suspected duplicate pair. `schoolId` is usually the newer record.
+model DuplicateCandidate {
+  id            String          @id @default(cuid())
+  schoolId      String
+  otherSchoolId String
+  score         Int // 0-100
+  reasons       String[]
+  status        DuplicateStatus @default(OPEN)
+  importBatchId String?
+  resolvedById  String?
+  resolvedAt    DateTime?
+  createdAt     DateTime        @default(now())
+
+  school      School       @relation("DuplicateSchool", fields: [schoolId], references: [id], onDelete: Cascade)
+  otherSchool School       @relation("DuplicateOther", fields: [otherSchoolId], references: [id], onDelete: Cascade)
+  importBatch ImportBatch? @relation(fields: [importBatchId], references: [id])
+  resolvedBy  User?        @relation(fields: [resolvedById], references: [id])
+
+  @@unique([schoolId, otherSchoolId])
+  @@index([status])
+  @@map("duplicate_candidates")
+}
+
+model ContactAttempt {
+  id           String         @id @default(cuid())
+  schoolId     String
+  userId       String
+  contactedAt  DateTime       @default(now())
+  channel      ContactChannel
+  outcome      ContactOutcome
+  notes        String?        @db.Text
+  nextStep     String?
+  nextStepDate DateTime?
+  createdAt    DateTime       @default(now())
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([schoolId])
+  @@map("contact_attempts")
+}
+
+// People at the school supplied during onboarding (not necessarily platform users).
+model StaffContact {
+  id        String   @id @default(cuid())
+  schoolId  String
+  name      String
+  position  String?
+  email     String?
+  phone     String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  @@index([schoolId])
+  @@map("staff_contacts")
+}
+
+model SchoolInvitation {
+  id                String         @id @default(cuid())
+  schoolId          String
+  kind              InvitationKind
+  email             String
+  tokenHash         String         @unique // sha256 of the token; the raw token only lives in the email
+  role              MembershipRole @default(STAFF)
+  canManageCourses  Boolean        @default(false)
+  canManageBookings Boolean        @default(false)
+  canViewFinances   Boolean        @default(false)
+  canManageStaff    Boolean        @default(false)
+  invitedById       String
+  expiresAt         DateTime
+  acceptedAt        DateTime?
+  revokedAt         DateTime?
+  createdAt         DateTime       @default(now())
+
+  school    School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  invitedBy User           @relation(fields: [invitedById], references: [id])
+  claims    ProfileClaim[]
+
+  @@index([schoolId])
+  @@map("school_invitations")
+}
+
+model ProfileClaim {
+  id                 String      @id @default(cuid())
+  schoolId           String
+  userId             String
+  invitationId       String?
+  claimantName       String
+  claimantPosition   String
+  claimantPhone      String?
+  claimantEmail      String
+  emailDomainMatches Boolean     @default(false)
+  message            String?     @db.Text
+  status             ClaimStatus @default(PENDING)
+  reviewedById       String?
+  reviewedAt         DateTime?
+  reviewNote         String?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  school     School            @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  user       User              @relation("ClaimUser", fields: [userId], references: [id], onDelete: Cascade)
+  invitation SchoolInvitation? @relation(fields: [invitationId], references: [id])
+  reviewedBy User?             @relation("ClaimReviewer", fields: [reviewedById], references: [id])
+  documents  ClaimDocument[]
+
+  @@index([status])
+  @@map("profile_claims")
+}
+
+// Proof-of-authority uploads. Stored in the database for now (small, capped size);
+// move to object storage when volume grows.
+model ClaimDocument {
+  id        String   @id @default(cuid())
+  claimId   String
+  fileName  String
+  mimeType  String
+  sizeBytes Int
+  data      Bytes
+  createdAt DateTime @default(now())
+
+  claim ProfileClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  @@map("claim_documents")
+}
+
+// ---------------------------------------------------------------------------
+// 3. Course inventory
+// ---------------------------------------------------------------------------
+
+enum CefrLevel {
+  A1
+  A2
+  B1
+  B2
+  C1
+  C2
+}
+
+enum CourseCategory {
+  STANDARD
+  INTENSIVE
+  EVENING
+  WEEKEND
+  PRIVATE
+  EXAM_PREP
+  INTEGRATION
+}
+
+enum CourseFormat {
+  IN_PERSON
+  ONLINE
+  HYBRID
+}
+
+enum PublicationStatus {
+  DRAFT
+  PENDING_APPROVAL
+  PUBLISHED
+  REJECTED
+  ARCHIVED
+}
+
+enum IntakeStatus {
+  OPEN
+  PAUSED
+  CLOSED
+  FULL // informational; availability is always computed from bookings and holds
+}
+
+model Branch {
+  id         String    @id @default(cuid())
+  schoolId   String
+  name       String
+  address    String?
+  postcode   String?
+  cityName   String?
+  cityId     String?
+  lat        Float?
+  lng        Float?
+  isOnline   Boolean   @default(false)
+  phone      String?
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  school      School       @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  city        City?        @relation(fields: [cityId], references: [id])
+  courseTypes CourseType[]
+
+  @@index([schoolId])
+  @@index([cityId])
+  @@index([postcode])
+  @@map("branches")
+}
+
+// A general course description, e.g. "German A1 evening course". Dated runs are Intakes.
+model CourseType {
+  id                String            @id @default(cuid())
+  schoolId          String
+  branchId          String
+  name              String
+  languageCode      String            @default("de")
+  level             CefrLevel
+  category          CourseCategory    @default(STANDARD)
+  format            CourseFormat      @default(IN_PERSON)
+  description       String?           @db.Text
+  lessonsPerWeek    Int
+  lessonMinutes     Int               @default(45)
+  cancellationTerms String            @db.Text
+  publicationStatus PublicationStatus @default(DRAFT)
+  submittedAt       DateTime?
+  reviewedAt        DateTime?
+  reviewedById      String?
+  rejectionReason   String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  school     School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  branch     Branch   @relation(fields: [branchId], references: [id])
+  language   Language @relation(fields: [languageCode], references: [code])
+  reviewedBy User?    @relation("CourseTypeReviewedBy", fields: [reviewedById], references: [id])
+  intakes    Intake[]
+  enquiries  Enquiry[]
+
+  @@index([schoolId])
+  @@index([publicationStatus])
+  @@map("course_types")
+}
+
+// A dated run of a course. Seat capacity lives here.
+model Intake {
+  id                 String       @id @default(cuid())
+  courseTypeId       String
+  schoolId           String
+  startDate          DateTime     @db.Date
+  endDate            DateTime     @db.Date
+  weekdays           Int[] // ISO weekday numbers, 1 = Monday … 7 = Sunday
+  startTime          String // "18:00", local time Europe/Berlin
+  endTime            String
+  priceCents         Int
+  currency           String       @default("EUR")
+  // priceCents + compulsory fees, kept in sync by the application for search and sorting.
+  totalPriceCents    Int
+  capacity           Int
+  bookingDeadline    DateTime?
+  status             IntakeStatus @default(OPEN)
+  instantBooking     Boolean      @default(true) // per-intake opt-out
+  lastConfirmedAt    DateTime     @default(now())
+  lastConfirmedById  String?
+  archivedAt         DateTime?
+  legacyCourseId     String?      @unique
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  courseType        CourseType  @relation(fields: [courseTypeId], references: [id], onDelete: Cascade)
+  school            School      @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  lastConfirmedBy   User?       @relation("IntakeConfirmedBy", fields: [lastConfirmedById], references: [id])
+  fees              IntakeFee[]
+  holds             SeatHold[]
+  bookings          Booking[]
+  enquiries         Enquiry[]
+
+  @@index([schoolId])
+  @@index([courseTypeId])
+  @@index([status, startDate])
+  @@map("intakes")
+}
+
+model IntakeFee {
+  id          String  @id @default(cuid())
+  intakeId    String
+  label       String
+  amountCents Int
+  compulsory  Boolean @default(true)
+
+  intake Intake @relation(fields: [intakeId], references: [id], onDelete: Cascade)
+
+  @@index([intakeId])
+  @@map("intake_fees")
+}
+
+enum HoldStatus {
+  ACTIVE
+  CONVERTED
+  EXPIRED
+  RELEASED
+}
+
+// A short temporary seat reservation during marketplace checkout.
+model SeatHold {
+  id         String     @id @default(cuid())
+  intakeId   String
+  bookingId  String     @unique
+  status     HoldStatus @default(ACTIVE)
+  expiresAt  DateTime
+  releasedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  intake  Intake  @relation(fields: [intakeId], references: [id], onDelete: Cascade)
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([intakeId, status, expiresAt])
+  @@map("seat_holds")
+}
+
+enum BookingChannel {
+  MARKETPLACE
+  DIRECT
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT // holding a seat during checkout
+  CONFIRMED
+  CANCELLED
+  EXPIRED // checkout abandoned or failed; seat released
+  FAILED_REFUNDED // paid, but the seat could not be confirmed; payment refunded
+  TRANSFERRED // moved to another intake (see transferredTo)
+}
+
+enum PaymentMethod {
+  CARD // online via the payment provider
+  PAY_AT_SCHOOL
+  CASH
+  BANK_TRANSFER
+  OTHER
+}
+
+model Booking {
+  id                  String         @id @default(cuid())
+  reference           String         @unique
+  intakeId            String
+  schoolId            String
+  channel             BookingChannel
+  status              BookingStatus
+  studentUserId       String?
+  studentId           String?
+  studentName         String
+  studentEmail        String
+  studentPhone        String?
+  priceCents          Int
+  feesCents           Int            @default(0)
+  totalCents          Int
+  currency            String         @default("EUR")
+  paymentMethod       PaymentMethod?
+  commissionCents     Int            @default(0)
+  commissionTermsId   String?
+  checkoutSessionId   String?        @unique
+  confirmedAt         DateTime?
+  cancelledAt         DateTime?
+  cancelReason        String?
+  cancellationRequestedAt DateTime?
+  transferredFromId   String?        @unique
+  notes               String?        @db.Text
+  createdById         String?
+  legacyEnrollmentId  String?        @unique
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  intake          Intake           @relation(fields: [intakeId], references: [id])
+  school          School           @relation(fields: [schoolId], references: [id])
+  studentUser     User?            @relation("BookingStudentUser", fields: [studentUserId], references: [id])
+  student         Student?         @relation(fields: [studentId], references: [id])
+  createdBy       User?            @relation("BookingCreatedBy", fields: [createdById], references: [id])
+  commissionTerms CommissionTerms? @relation(fields: [commissionTermsId], references: [id])
+  transferredFrom Booking?         @relation("BookingTransfer", fields: [transferredFromId], references: [id])
+  transferredTo   Booking?         @relation("BookingTransfer")
+  hold            SeatHold?
+  payments        Payment[]
+  refunds         Refund[]
+  supportRequests SupportRequest[]
+
+  @@index([intakeId, status])
+  @@index([schoolId, status])
+  @@index([studentUserId])
+  @@map("bookings")
+}
+
+// ---------------------------------------------------------------------------
+// 4. Money
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  UNPAID // legacy enrollment flag
+  PARTIAL // legacy enrollment flag
+  PAID // legacy enrollment flag
+}
+
+enum PaymentRecordStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model Payment {
+  id                    String              @id @default(cuid())
+  bookingId             String
+  schoolId              String
+  amountCents           Int
+  currency              String              @default("EUR")
+  method                PaymentMethod
+  status                PaymentRecordStatus @default(SUCCEEDED)
+  // Unique so duplicate provider notifications can never create a second payment.
+  providerPaymentId     String?             @unique
+  providerSessionId     String?
+  paidAt                DateTime            @default(now())
+  note                  String?
+  recordedById          String?
+  createdAt             DateTime            @default(now())
+
+  booking    Booking  @relation(fields: [bookingId], references: [id])
+  school     School   @relation(fields: [schoolId], references: [id])
+  recordedBy User?    @relation(fields: [recordedById], references: [id])
+  refunds    Refund[]
+
+  @@index([bookingId])
+  @@index([schoolId])
+  @@map("payments")
+}
+
+model Refund {
+  id               String       @id @default(cuid())
+  paymentId        String
+  bookingId        String
+  amountCents      Int
+  reason           String?
+  status           RefundStatus @default(PENDING)
+  providerRefundId String?      @unique
+  createdById      String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  payment   Payment @relation(fields: [paymentId], references: [id])
+  booking   Booking @relation(fields: [bookingId], references: [id])
+  createdBy User?   @relation(fields: [createdById], references: [id])
+
+  @@index([bookingId])
+  @@map("refunds")
+}
+
+// Provider webhook events already handled, so redelivery is a no-op.
+model ProcessedWebhookEvent {
+  id          String   @id // provider event id
+  provider    String
+  type        String
+  processedAt DateTime @default(now())
+
+  @@map("processed_webhook_events")
+}
+
+enum CommissionType {
+  FIXED
+  PERCENT
+}
+
+// Per-school commission on confirmed marketplace bookings. The row valid at
+// confirmation time is snapshotted onto the booking.
+model CommissionTerms {
+  id          String         @id @default(cuid())
+  schoolId    String
+  type        CommissionType
+  fixedCents  Int?
+  percentBps  Int? // basis points: 1000 = 10 %
+  currency    String         @default("EUR")
+  validFrom   DateTime       @default(now())
+  validTo     DateTime?
+  note        String?
+  createdById String?
+  createdAt   DateTime       @default(now())
+
+  school    School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  createdBy User?     @relation(fields: [createdById], references: [id])
+  bookings  Booking[]
+
+  @@index([schoolId, validFrom])
+  @@map("commission_terms")
+}
+
+enum SubscriptionStatus {
+  NONE
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  schoolId               String
+  plan                   String             @default("school-app")
+  monthlyPriceCents      Int
+  currency               String             @default("EUR")
+  status                 SubscriptionStatus @default(NONE)
+  startedAt              DateTime?
+  currentPeriodEnd       DateTime?
+  providerSubscriptionId String?            @unique
+  note                   String?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  @@index([schoolId])
+  @@map("subscriptions")
+}
+
+// ---------------------------------------------------------------------------
+// 5. Communication, support, audit, analytics
+// ---------------------------------------------------------------------------
+
+enum EnquiryStatus {
+  NEW
+  RESPONDED
+  CLOSED
+}
+
+model Enquiry {
+  id            String        @id @default(cuid())
+  schoolId      String
+  courseTypeId  String?
+  intakeId      String?
+  userId        String?
+  name          String
+  email         String
+  phone         String?
+  message       String        @db.Text
+  status        EnquiryStatus @default(NEW)
+  response      String?       @db.Text
+  respondedAt   DateTime?
+  respondedById String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  school      School      @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  courseType  CourseType? @relation(fields: [courseTypeId], references: [id])
+  intake      Intake?     @relation(fields: [intakeId], references: [id])
+  user        User?       @relation("EnquiryUser", fields: [userId], references: [id])
+  respondedBy User?       @relation("EnquiryRespondedBy", fields: [respondedById], references: [id])
+
+  @@index([schoolId, status])
+  @@map("enquiries")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String? // a specific user…
+  schoolId  String? // …or a school's shared inbox
+  type      String
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  school School? @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([schoolId, readAt])
+  @@map("notifications")
+}
+
+enum SupportType {
+  GENERAL
+  CANCELLATION
+  REFUND
+  BOOKING_PROBLEM
+  SCHOOL_DATA
+}
+
+enum SupportStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+model SupportRequest {
+  id           String        @id @default(cuid())
+  type         SupportType   @default(GENERAL)
+  status       SupportStatus @default(OPEN)
+  subject      String
+  message      String        @db.Text
+  email        String
+  requesterId  String?
+  bookingId    String?
+  schoolId     String?
+  assigneeId   String?
+  resolution   String?       @db.Text
+  resolvedAt   DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  requester User?    @relation("SupportRequester", fields: [requesterId], references: [id])
+  assignee  User?    @relation("SupportAssignee", fields: [assigneeId], references: [id])
+  booking   Booking? @relation(fields: [bookingId], references: [id])
+  school    School?  @relation(fields: [schoolId], references: [id])
+
+  @@index([status])
+  @@map("support_requests")
+}
+
+enum ActorType {
+  USER
+  SYSTEM
+  PAYMENT_PROVIDER
+}
+
+model AuditEvent {
+  id        String    @id @default(cuid())
+  actorId   String?
+  actorType ActorType @default(USER)
+  schoolId  String?
+  entity    String // e.g. "Intake", "Booking", "School"
+  entityId  String
+  action    String // e.g. "intake.price_changed", "booking.confirmed"
+  before    Json?
+  after     Json?
+  createdAt DateTime  @default(now())
+
+  actor  User?   @relation(fields: [actorId], references: [id])
+  school School? @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([schoolId, createdAt])
+  @@index([createdAt])
+  @@map("audit_events")
+}
+
+// Funnel metrics: searches, checkout starts, etc.
+model AnalyticsEvent {
+  id        String   @id @default(cuid())
+  type      String // "search", "checkout_started", …
+  userId    String?
+  schoolId  String?
+  intakeId  String?
+  data      Json?
+  createdAt DateTime @default(now())
+
+  @@index([type, createdAt])
+  @@map("analytics_events")
+}
+
+// Postcode centroids for distance search (import from GeoNames, CC BY 4.0).
+model PostcodeLocation {
+  postcode String @id
+  place    String
+  lat      Float
+  lng      Float
+
+  @@map("postcode_locations")
+}
+
+// ---------------------------------------------------------------------------
+// 6. Legacy single-school models
+// ---------------------------------------------------------------------------
+
+enum GermanLevel {
+  A1
+  A2
+  B1
+  B2
+  C1
+  C2
+}
+
+enum LearningMode {
+  ONLINE
+  INPERSON
+  HYBRID
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  DROPPED
+}
+
+enum RegistrationStatus {
+  NEW
+  CONTACTED
+  ACCEPTED
+  ON_HOLD
+  ENROLLED
+  REJECTED
+}
+
+enum StudentStatus {
+  ACTIVE
+  INACTIVE
+  COMPLETED
+}
+
+enum CourseStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum TrialLessonStatus {
+  PENDING
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+model Student {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  phone                String?
+  country              String?
+  dateOfBirth          DateTime?
+  germanLevel          GermanLevel?
+  learningMode         LearningMode?
+  preferredClassTime   String?
+  status               StudentStatus @default(ACTIVE)
+  profileComplete      Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  enrollments  Enrollment[]
+  certificates Certificate[]
+  adminNotes   AdminNote[]
+  bookings     Booking[]
+
+  @@map("students")
+}
+
+model Instructor {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  specializations String?
+  bio             String?
+  certifications  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courses      Course[]
+  trialLessons TrialLesson[]
+
+  @@map("instructors")
+}
+
+model Course {
+  id           String   @id @default(cuid())
+  name         String
+  language     String   @default("German")
+  level        String   // A1-C1
+  description  String?
+  duration     Int      // in hours
+  price        Float
+  maxStudents  Int      @default(15)
+  status       CourseStatus @default(ACTIVE)
+  instructorId String?
+  startDate    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  instructor  Instructor?  @relation(fields: [instructorId], references: [id])
+  enrollments Enrollment[]
+  certificates Certificate[]
+
+  @@map("courses")
+}
+
+model Enrollment {
+  id               String   @id @default(cuid())
+  studentId        String
+  courseId         String
+  enrollmentDate   DateTime @default(now())
+  status           EnrollmentStatus @default(ACTIVE)
+  paymentStatus    PaymentStatus @default(UNPAID)
+  certificateUrl   String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course  Course  @relation(fields: [courseId], references: [id])
+
+  @@map("enrollments")
+}
+
+model TrialLesson {
+  id             String   @id @default(cuid())
+  name           String
+  email          String
+  phone          String
+  preferredDate  String?
+  preferredTime  String?
+  germanLevel    GermanLevel?
+  notes          String?
+  status         TrialLessonStatus @default(PENDING)
+  instructorId   String?
+  scheduledDate  DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  instructor Instructor? @relation(fields: [instructorId], references: [id])
+  adminNotes AdminNote[]
+
+  @@map("trial_lessons")
+}
+
+model Registration {
+  id                  String   @id @default(cuid())
+  fullName            String
+  email               String
+  phone               String
+  country             String?
+  preferredCourse     String?
+  germanLevel         GermanLevel?
+  learningMode        LearningMode?
+  preferredClassTime  String?
+  additionalMessage   String?
+  status              RegistrationStatus @default(NEW)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  adminNotes AdminNote[]
+
+  @@map("registrations")
+}
+
+model Certificate {
+  id                 String   @id @default(cuid())
+  studentId          String
+  courseId           String
+  issueDate          DateTime
+  certificateNumber  String   @unique
+  verificationUrl    String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course  Course  @relation(fields: [courseId], references: [id])
+
+  @@map("certificates")
+}
+
+model AdminNote {
+  id             String   @id @default(cuid())
+  userId         String
+  registrationId String?
+  trialLessonId  String?
+  studentId      String?
+  content        String
+  createdAt      DateTime @default(now())
+
+  user        User         @relation(fields: [userId], references: [id])
+  registration Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  trialLesson TrialLesson? @relation(fields: [trialLessonId], references: [id], onDelete: SetNull)
+  student     Student?     @relation(fields: [studentId], references: [id], onDelete: SetNull)
+
+  @@map("admin_notes")
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
